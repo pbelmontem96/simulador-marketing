@@ -6,3 +6,5 @@ plotly
 reportlab
 openpyxl
 pillow
+psycopg2-binary
+sqlalchemy

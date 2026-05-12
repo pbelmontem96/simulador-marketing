@@ -1,20 +1,29 @@
+import copy
+import hashlib
 import json
 import os
 import sqlite3
-import hashlib
+import threading
+import time
 from contextlib import closing
 from typing import Any, Optional
 
 # =========================================================
-# BASE DE DATOS DEL SIMULADOR
+# BASE DE DATOS DEL SIMULADOR - VERSIÓN OPTIMIZADA
 # =========================================================
 # Funcionamiento:
 # - En local: usa SQLite (simulator.db), como hasta ahora.
 # - En Streamlit Cloud: si existe DATABASE_URL en Secrets o variables de entorno,
 #   usa PostgreSQL/Supabase automáticamente.
 #
+# Mejoras de rendimiento:
+# - Pool de conexiones para PostgreSQL/Supabase.
+# - Caché corta de lecturas frecuentes.
+# - Invalidación automática de caché tras escrituras.
+# - init_db() solo se ejecuta una vez por sesión/proceso.
+#
 # En Streamlit Cloud añade en Secrets:
-# DATABASE_URL = "postgresql://postgres:TU_PASSWORD@db.xxxxx.supabase.co:5432/postgres"
+# DATABASE_URL = "postgresql://postgres.xxxxx:TU_PASSWORD@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 #
 # En requirements.txt añade:
 # psycopg2-binary
@@ -22,13 +31,29 @@ from typing import Any, Optional
 
 DB_PATH = os.environ.get("SIM_DB_PATH", os.path.join(os.path.dirname(__file__), "simulator.db"))
 
+# Ajustes de rendimiento.
+CACHE_TTL_SECONDS = float(os.environ.get("SIM_DB_CACHE_TTL", "3"))
+PG_POOL_MINCONN = int(os.environ.get("SIM_DB_PG_POOL_MINCONN", "1"))
+PG_POOL_MAXCONN = int(os.environ.get("SIM_DB_PG_POOL_MAXCONN", "8"))
+
+_DB_INITIALIZED = False
+_PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+_READ_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+# -------------------------------------------------
+# UTILIDADES INTERNAS
+# -------------------------------------------------
 
 def _get_database_url() -> Optional[str]:
     """Obtiene la URL de PostgreSQL desde Streamlit Secrets o variables de entorno."""
     try:
         import streamlit as st  # Import opcional para que el archivo siga funcionando fuera de Streamlit.
         if "DATABASE_URL" in st.secrets:
-            return str(st.secrets["DATABASE_URL"]).strip()
+            value = str(st.secrets["DATABASE_URL"]).strip()
+            return value if value else None
     except Exception:
         pass
 
@@ -46,8 +71,73 @@ def _pg_sql(sql: str) -> str:
     return sql.replace("?", "%s")
 
 
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str):
+    if CACHE_TTL_SECONDS <= 0:
+        return None
+
+    now = time.time()
+    with _CACHE_LOCK:
+        item = _READ_CACHE.get(key)
+        if not item:
+            return None
+
+        expires_at, value = item
+        if expires_at < now:
+            _READ_CACHE.pop(key, None)
+            return None
+
+        return copy.deepcopy(value)
+
+
+def _cache_set(key: str, value: Any):
+    if CACHE_TTL_SECONDS <= 0:
+        return value
+
+    with _CACHE_LOCK:
+        _READ_CACHE[key] = (time.time() + CACHE_TTL_SECONDS, copy.deepcopy(value))
+
+    return value
+
+
+def _clear_read_cache():
+    with _CACHE_LOCK:
+        _READ_CACHE.clear()
+
+
+def _get_pg_pool():
+    """Crea o reutiliza un pool de conexiones para Supabase/PostgreSQL."""
+    global _PG_POOL
+
+    database_url = _get_database_url()
+    if not database_url:
+        return None
+
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None:
+            import psycopg2
+            from psycopg2.pool import SimpleConnectionPool
+            from psycopg2.extras import RealDictCursor
+
+            _PG_POOL = SimpleConnectionPool(
+                PG_POOL_MINCONN,
+                PG_POOL_MAXCONN,
+                dsn=database_url,
+                cursor_factory=RealDictCursor,
+            )
+
+        return _PG_POOL
+
+
+# -------------------------------------------------
+# ADAPTADORES POSTGRESQL
+# -------------------------------------------------
+
 class PostgresCursor:
-    """Pequeño adaptador para que psycopg2 se comporte parecido a sqlite3."""
+    """Adaptador para que psycopg2 se comporte parecido a sqlite3."""
 
     def __init__(self, cursor):
         self._cursor = cursor
@@ -86,8 +176,10 @@ class PostgresCursor:
 class PostgresConnection:
     """Adaptador mínimo para mantener la API conn.execute(...) del db.py original."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, pool=None):
         self._conn = conn
+        self._pool = pool
+        self._closed = False
 
     def cursor(self):
         return PostgresCursor(self._conn.cursor())
@@ -103,8 +195,20 @@ class PostgresConnection:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if self._closed:
+            return
 
+        self._closed = True
+        if self._pool is not None:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        else:
+            self._conn.close()
 
 
 def get_conn():
@@ -112,30 +216,35 @@ def get_conn():
     database_url = _get_database_url()
 
     if database_url and database_url.startswith(("postgresql://", "postgres://")):
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-
-        conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
-        return PostgresConnection(conn)
+        pool = _get_pg_pool()
+        conn = pool.getconn()
+        return PostgresConnection(conn, pool=pool)
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
 # -------------------------------------------------
 # INICIALIZACIÓN DE BASE DE DATOS
 # -------------------------------------------------
 
-def init_db():
+def init_db(force: bool = False):
+    """Inicializa la base de datos.
+
+    Por rendimiento, solo se ejecuta una vez por proceso salvo que se use force=True.
+    """
+    global _DB_INITIALIZED
+
+    if _DB_INITIALIZED and not force:
+        return
+
     if _is_postgres():
         _init_postgres_db()
     else:
         _init_sqlite_db()
+
+    _DB_INITIALIZED = True
 
 
 def _init_sqlite_db():
@@ -259,6 +368,26 @@ def _init_postgres_db():
             """
         )
 
+        # Índices útiles para acelerar lecturas frecuentes.
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_games_updated_at
+            ON games (updated_at DESC, game_id DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_decisions_game_round
+            ON decisions (game_id, round_n, team_name)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_team_access_game_team
+            ON team_access (game_id, team_name)
+            """
+        )
+
         conn.commit()
 
 
@@ -267,6 +396,11 @@ def _init_postgres_db():
 # -------------------------------------------------
 
 def game_exists(game_name: str | None = None) -> bool:
+    cache_key = f"game_exists:{game_name!r}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return bool(cached)
+
     with closing(get_conn()) as conn:
         if game_name:
             row = conn.execute(
@@ -275,10 +409,18 @@ def game_exists(game_name: str | None = None) -> bool:
             ).fetchone()
         else:
             row = conn.execute("SELECT 1 FROM games LIMIT 1").fetchone()
-        return row is not None
+
+        result = row is not None
+        _cache_set(cache_key, result)
+        return result
 
 
 def list_games():
+    cache_key = "list_games"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         rows = conn.execute(
             """
@@ -288,19 +430,27 @@ def list_games():
             """
         ).fetchall()
 
-        return [
+        result = [
             {
                 "game_id": int(row["game_id"]),
                 "game_name": row["game_name"],
                 "round_n": int(row["round_n"]),
                 "round_status": row["round_status"],
-                "updated_at": row["updated_at"],
+                "updated_at": str(row["updated_at"]),
             }
             for row in rows
         ]
 
+        _cache_set(cache_key, result)
+        return result
+
 
 def get_game_by_id(game_id: int):
+    cache_key = f"get_game_by_id:{int(game_id)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         row = conn.execute(
             """
@@ -312,18 +462,27 @@ def get_game_by_id(game_id: int):
         ).fetchone()
 
         if row is None:
+            _cache_set(cache_key, None)
             return None
 
-        return {
+        result = {
             "game_id": int(row["game_id"]),
             "game_name": row["game_name"],
             "round_n": int(row["round_n"]),
             "round_status": row["round_status"],
-            "updated_at": row["updated_at"],
+            "updated_at": str(row["updated_at"]),
         }
+
+        _cache_set(cache_key, result)
+        return result
 
 
 def get_game_by_name(game_name: str):
+    cache_key = f"get_game_by_name:{game_name!r}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         row = conn.execute(
             """
@@ -335,18 +494,27 @@ def get_game_by_name(game_name: str):
         ).fetchone()
 
         if row is None:
+            _cache_set(cache_key, None)
             return None
 
-        return {
+        result = {
             "game_id": int(row["game_id"]),
             "game_name": row["game_name"],
             "round_n": int(row["round_n"]),
             "round_status": row["round_status"],
-            "updated_at": row["updated_at"],
+            "updated_at": str(row["updated_at"]),
         }
+
+        _cache_set(cache_key, result)
+        return result
 
 
 def get_latest_game_id():
+    cache_key = "get_latest_game_id"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         row = conn.execute(
             """
@@ -356,7 +524,10 @@ def get_latest_game_id():
             LIMIT 1
             """
         ).fetchone()
-        return int(row["game_id"]) if row else None
+
+        result = int(row["game_id"]) if row else None
+        _cache_set(cache_key, result)
+        return result
 
 
 # -------------------------------------------------
@@ -421,7 +592,9 @@ def create_game(
             )
 
         conn.commit()
-        return int(game_id)
+
+    _clear_read_cache()
+    return int(game_id)
 
 
 def create_or_replace_game(
@@ -475,6 +648,8 @@ def rename_game(game_id: int, new_game_name: str):
         )
         conn.commit()
 
+    _clear_read_cache()
+
 
 def delete_game(game_id: int):
     with closing(get_conn()) as conn:
@@ -483,6 +658,8 @@ def delete_game(game_id: int):
         conn.execute("DELETE FROM team_access WHERE game_id = ?", (game_id,))
         conn.execute("DELETE FROM games WHERE game_id = ?", (game_id,))
         conn.commit()
+
+    _clear_read_cache()
 
 
 def duplicate_game(source_game_id: int, new_game_name: str):
@@ -555,6 +732,7 @@ def duplicate_game(source_game_id: int, new_game_name: str):
 
         conn.commit()
 
+    _clear_read_cache()
     return new_game_id
 
 
@@ -563,6 +741,11 @@ def duplicate_game(source_game_id: int, new_game_name: str):
 # -------------------------------------------------
 
 def load_game_state(game_id: int):
+    cache_key = f"load_game_state:{int(game_id)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         row = conn.execute(
             "SELECT * FROM games WHERE game_id = ?",
@@ -570,10 +753,11 @@ def load_game_state(game_id: int):
         ).fetchone()
 
         if row is None:
+            _cache_set(cache_key, None)
             return None
 
         teams = json.loads(row["teams_json"])
-        return {
+        result = {
             "game_id": int(row["game_id"]),
             "game_name": row["game_name"],
             "teams": teams,
@@ -589,8 +773,11 @@ def load_game_state(game_id: int):
                 team: int(row["budget_per_team"]) for team in teams
             },
             "event_this_round": bool(row["event_this_round"]),
-            "updated_at": row["updated_at"],
+            "updated_at": str(row["updated_at"]),
         }
+
+        _cache_set(cache_key, result)
+        return result
 
 
 def update_game_state(game_id: int, **fields):
@@ -626,6 +813,8 @@ def update_game_state(game_id: int, **fields):
         conn.execute(f"UPDATE games SET {columns} WHERE game_id = ?", values)
         conn.commit()
 
+    _clear_read_cache()
+
 
 # -------------------------------------------------
 # CLAVES
@@ -643,8 +832,11 @@ def set_professor_password(game_id: int, password: str):
         )
         conn.commit()
 
+    _clear_read_cache()
+
 
 def verify_professor_password(game_id: int, password: str) -> bool:
+    # No se cachea por seguridad: evita resultados raros justo tras cambiar clave.
     with closing(get_conn()) as conn:
         row = conn.execute(
             "SELECT professor_password_hash FROM games WHERE game_id = ?",
@@ -658,6 +850,7 @@ def verify_professor_password(game_id: int, password: str) -> bool:
 
 
 def verify_team_password(game_id: int, team_name: str, password: str) -> bool:
+    # No se cachea por seguridad: evita resultados raros justo tras cambiar clave.
     with closing(get_conn()) as conn:
         row = conn.execute(
             """
@@ -686,8 +879,15 @@ def update_team_password(game_id: int, team_name: str, password: str):
         )
         conn.commit()
 
+    _clear_read_cache()
+
 
 def list_team_passwords_masked(game_id: int):
+    cache_key = f"list_team_passwords_masked:{int(game_id)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         rows = conn.execute(
             """
@@ -699,7 +899,9 @@ def list_team_passwords_masked(game_id: int):
             (game_id,)
         ).fetchall()
 
-        return [row["team_name"] for row in rows]
+        result = [row["team_name"] for row in rows]
+        _cache_set(cache_key, result)
+        return result
 
 
 # -------------------------------------------------
@@ -722,8 +924,15 @@ def upsert_decision(game_id: int, team_name: str, round_n: int, decision: dict):
         )
         conn.commit()
 
+    _clear_read_cache()
+
 
 def get_decision(game_id: int, team_name: str, round_n: int):
+    cache_key = f"get_decision:{int(game_id)}:{team_name!r}:{int(round_n)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         row = conn.execute(
             """
@@ -735,20 +944,29 @@ def get_decision(game_id: int, team_name: str, round_n: int):
         ).fetchone()
 
         if row is None:
+            _cache_set(cache_key, None)
             return None
 
-        return {
+        result = {
             "game_id": int(row["game_id"]),
             "team_name": row["team_name"],
             "round_n": int(row["round_n"]),
             "decision": json.loads(row["decision_json"]),
             "reviewed": bool(row["reviewed"]),
             "review_notes": row["review_notes"] or "",
-            "submitted_at": row["submitted_at"],
+            "submitted_at": str(row["submitted_at"]),
         }
+
+        _cache_set(cache_key, result)
+        return result
 
 
 def get_all_decisions(game_id: int, round_n: int):
+    cache_key = f"get_all_decisions:{int(game_id)}:{int(round_n)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     with closing(get_conn()) as conn:
         rows = conn.execute(
             """
@@ -766,8 +984,10 @@ def get_all_decisions(game_id: int, round_n: int):
                 "decision": json.loads(row["decision_json"]),
                 "reviewed": bool(row["reviewed"]),
                 "review_notes": row["review_notes"] or "",
-                "submitted_at": row["submitted_at"],
+                "submitted_at": str(row["submitted_at"]),
             }
+
+        _cache_set(cache_key, out)
         return out
 
 
@@ -783,6 +1003,8 @@ def set_review_status(game_id: int, team_name: str, round_n: int, reviewed: bool
         )
         conn.commit()
 
+    _clear_read_cache()
+
 
 def delete_decisions_for_round(game_id: int, round_n: int):
     with closing(get_conn()) as conn:
@@ -794,3 +1016,5 @@ def delete_decisions_for_round(game_id: int, round_n: int):
             (game_id, round_n)
         )
         conn.commit()
+
+    _clear_read_cache()

@@ -3,11 +3,121 @@ import os
 import sqlite3
 import hashlib
 from contextlib import closing
+from typing import Any, Optional
+
+# =========================================================
+# BASE DE DATOS DEL SIMULADOR
+# =========================================================
+# Funcionamiento:
+# - En local: usa SQLite (simulator.db), como hasta ahora.
+# - En Streamlit Cloud: si existe DATABASE_URL en Secrets o variables de entorno,
+#   usa PostgreSQL/Supabase automáticamente.
+#
+# En Streamlit Cloud añade en Secrets:
+# DATABASE_URL = "postgresql://postgres:TU_PASSWORD@db.xxxxx.supabase.co:5432/postgres"
+#
+# En requirements.txt añade:
+# psycopg2-binary
+# =========================================================
 
 DB_PATH = os.environ.get("SIM_DB_PATH", os.path.join(os.path.dirname(__file__), "simulator.db"))
 
 
+def _get_database_url() -> Optional[str]:
+    """Obtiene la URL de PostgreSQL desde Streamlit Secrets o variables de entorno."""
+    try:
+        import streamlit as st  # Import opcional para que el archivo siga funcionando fuera de Streamlit.
+        if "DATABASE_URL" in st.secrets:
+            return str(st.secrets["DATABASE_URL"]).strip()
+    except Exception:
+        pass
+
+    value = os.environ.get("DATABASE_URL")
+    return value.strip() if value else None
+
+
+def _is_postgres() -> bool:
+    url = _get_database_url()
+    return bool(url and url.startswith(("postgresql://", "postgres://")))
+
+
+def _pg_sql(sql: str) -> str:
+    """Traduce placeholders SQLite (?) a placeholders psycopg2 (%s)."""
+    return sql.replace("?", "%s")
+
+
+class PostgresCursor:
+    """Pequeño adaptador para que psycopg2 se comporte parecido a sqlite3."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    def execute(self, sql: str, params: Any = None):
+        sql_clean = sql.strip()
+        sql_pg = _pg_sql(sql_clean)
+
+        # En PostgreSQL necesitamos RETURNING para recuperar el id de la partida creada.
+        is_insert_games = sql_clean.upper().startswith("INSERT INTO GAMES")
+        if is_insert_games and "RETURNING" not in sql_clean.upper():
+            sql_pg = sql_pg.rstrip().rstrip(";") + " RETURNING game_id"
+            self._cursor.execute(sql_pg, params or ())
+            row = self._cursor.fetchone()
+            if row is not None:
+                self.lastrowid = int(row["game_id"] if isinstance(row, dict) else row[0])
+            return self
+
+        self._cursor.execute(sql_pg, params or ())
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def close(self):
+        self._cursor.close()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+
+class PostgresConnection:
+    """Adaptador mínimo para mantener la API conn.execute(...) del db.py original."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return PostgresCursor(self._conn.cursor())
+
+    def execute(self, sql: str, params: Any = None):
+        cur = self.cursor()
+        return cur.execute(sql, params or ())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+
 def get_conn():
+    """Devuelve conexión SQLite local o PostgreSQL/Supabase en producción."""
+    database_url = _get_database_url()
+
+    if database_url and database_url.startswith(("postgresql://", "postgres://")):
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+        return PostgresConnection(conn)
+
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -17,7 +127,18 @@ def _hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
+# -------------------------------------------------
+# INICIALIZACIÓN DE BASE DE DATOS
+# -------------------------------------------------
+
 def init_db():
+    if _is_postgres():
+        _init_postgres_db()
+    else:
+        _init_sqlite_db()
+
+
+def _init_sqlite_db():
     with closing(get_conn()) as conn:
         cur = conn.cursor()
 
@@ -72,6 +193,69 @@ def init_db():
                 PRIMARY KEY (game_id, team_name, round_n),
                 FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
             )
+            """
+        )
+
+        conn.commit()
+
+
+def _init_postgres_db():
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS games (
+                game_id SERIAL PRIMARY KEY,
+                game_name TEXT NOT NULL UNIQUE,
+                teams_json TEXT NOT NULL,
+                budget_per_team INTEGER NOT NULL,
+                round_n INTEGER NOT NULL,
+                round_status TEXT NOT NULL,
+                engine_state_json TEXT NOT NULL,
+                history_json TEXT NOT NULL,
+                last_truth_json TEXT,
+                last_research_json TEXT,
+                last_event_json TEXT,
+                team_budgets_json TEXT,
+                event_this_round INTEGER NOT NULL DEFAULT 0,
+                professor_password_hash TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS team_access (
+                game_id INTEGER NOT NULL REFERENCES games(game_id) ON DELETE CASCADE,
+                team_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                PRIMARY KEY (game_id, team_name)
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decisions (
+                game_id INTEGER NOT NULL REFERENCES games(game_id) ON DELETE CASCADE,
+                team_name TEXT NOT NULL,
+                round_n INTEGER NOT NULL,
+                decision_json TEXT NOT NULL,
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed INTEGER NOT NULL DEFAULT 0,
+                review_notes TEXT DEFAULT '',
+                PRIMARY KEY (game_id, team_name, round_n)
+            )
+            """
+        )
+
+        # Migración defensiva por si una tabla antigua no tenía esta columna.
+        cur.execute(
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS team_budgets_json TEXT
             """
         )
 
@@ -193,8 +377,8 @@ def create_game(
     last_research,
     last_event,
     team_budgets=None,
-    event_this_round,
-    professor_password,
+    event_this_round=False,
+    professor_password="admin123",
 ):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
@@ -254,8 +438,8 @@ def create_or_replace_game(
     last_research,
     last_event,
     team_budgets=None,
-    event_this_round,
-    professor_password,
+    event_this_round=False,
+    professor_password="admin123",
 ):
     existing = get_game_by_name(game_name)
     if existing:
@@ -273,6 +457,7 @@ def create_or_replace_game(
         last_truth=last_truth,
         last_research=last_research,
         last_event=last_event,
+        team_budgets=team_budgets,
         event_this_round=event_this_round,
         professor_password=professor_password,
     )
@@ -293,6 +478,7 @@ def rename_game(game_id: int, new_game_name: str):
 
 def delete_game(game_id: int):
     with closing(get_conn()) as conn:
+        # Aunque existe ON DELETE CASCADE, se mantiene el borrado explícito por compatibilidad.
         conn.execute("DELETE FROM decisions WHERE game_id = ?", (game_id,))
         conn.execute("DELETE FROM team_access WHERE game_id = ?", (game_id,))
         conn.execute("DELETE FROM games WHERE game_id = ?", (game_id,))
@@ -386,10 +572,11 @@ def load_game_state(game_id: int):
         if row is None:
             return None
 
+        teams = json.loads(row["teams_json"])
         return {
             "game_id": int(row["game_id"]),
             "game_name": row["game_name"],
-            "teams": json.loads(row["teams_json"]),
+            "teams": teams,
             "budget_per_team": int(row["budget_per_team"]),
             "round_n": int(row["round_n"]),
             "round_status": row["round_status"],
@@ -399,7 +586,7 @@ def load_game_state(game_id: int):
             "last_research": json.loads(row["last_research_json"]) if row["last_research_json"] else None,
             "last_event": json.loads(row["last_event_json"]) if row["last_event_json"] else None,
             "team_budgets": json.loads(row["team_budgets_json"]) if row["team_budgets_json"] else {
-                team: int(row["budget_per_team"]) for team in json.loads(row["teams_json"])
+                team: int(row["budget_per_team"]) for team in teams
             },
             "event_this_round": bool(row["event_this_round"]),
             "updated_at": row["updated_at"],

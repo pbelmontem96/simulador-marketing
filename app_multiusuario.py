@@ -285,6 +285,34 @@ def backfill_team_budgets_from_history(state):
         rebuilt.setdefault(team, base_budget)
     return rebuilt
 
+@st.cache_data(ttl=3, show_spinner=False)
+def cached_load_game_state(game_id: int):
+    return load_game_state(game_id)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def cached_list_games():
+    return list_games()
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def cached_get_all_decisions(game_id: int, round_n: int):
+    return get_all_decisions(game_id, round_n)
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def cached_get_decision(game_id: int, team_name: str, round_n: int):
+    return get_decision(game_id, team_name, round_n)
+
+
+def clear_runtime_cache():
+    """Limpia la caché de Streamlit tras cualquier escritura en base de datos."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 def load_current_state():
     game_id = st.session_state.get("current_game_id")
     if game_id is None:
@@ -296,12 +324,12 @@ def load_current_state():
     if game_id is None:
         return None
 
-    state = load_game_state(game_id)
+    state = cached_load_game_state(int(game_id))
     if state is None:
         latest_id = get_latest_game_id()
         if latest_id is not None:
             st.session_state["current_game_id"] = latest_id
-            return load_game_state(latest_id)
+            return cached_load_game_state(int(latest_id))
         return None
     return state
 
@@ -2364,7 +2392,7 @@ def build_decision_payload(game_id, team, teams, engine, available_budget, round
     inject_decision_phase4_styles()
     inject_decision_phase5_styles()
 
-    existing_entry = get_decision(game_id, team, round_n)
+    existing_entry = cached_get_decision(game_id, team, round_n)
     existing = existing_entry["decision"] if existing_entry else {}
     ref_units = estimate_reference_units(team, teams, engine)
 
@@ -3774,7 +3802,7 @@ def render_team_budget(team, teams, engine, state, current_team_budget, round_n,
     inject_budget_phase2_styles()
     inject_budget_phase3_styles()
 
-    existing_entry = get_decision(game_id, team, round_n)
+    existing_entry = cached_get_decision(game_id, team, round_n)
     decision = existing_entry["decision"] if existing_entry else {}
     if not decision:
         st.info("Aún no hay una decisión guardada en esta ronda. Esta pantalla se completará con tu decisión actual cuando la guardes.")
@@ -7500,6 +7528,7 @@ if state is None:
 migrated_team_budgets = backfill_team_budgets_from_history(state)
 if migrated_team_budgets != (state.get("team_budgets", {}) or {}):
     update_game_state(state["game_id"], team_budgets=migrated_team_budgets)
+    clear_runtime_cache()
     state = load_current_state()
 
 game_id = state["game_id"]
@@ -7510,10 +7539,10 @@ engine.set_state(state["engine_state"])
 round_n = state["round_n"]
 budget_per_team = state["budget_per_team"]
 round_status = state["round_status"]
-all_decisions = get_all_decisions(game_id, round_n)
-all_games = list_games()
+all_games = cached_list_games()
 
 team_section = None
+all_decisions = {}
 
 with st.sidebar:
     render_sidebar_brand()
@@ -7611,6 +7640,16 @@ with st.sidebar:
         st.divider()
         st.button("⇱  Cerrar sesión", on_click=logout, use_container_width=True)
 
+# Carga decisiones solo cuando son necesarias. Evita consultar toda la tabla en cada rerun.
+needs_all_decisions = (
+    st.session_state.get("role") == "professor"
+    or (st.session_state.get("role") == "team" and team_section == "Informes")
+)
+if needs_all_decisions:
+    all_decisions = cached_get_all_decisions(game_id, round_n)
+else:
+    all_decisions = {}
+
 round_status_label = "abierta" if round_status == "open" else "cerrada"
 st.markdown(f"<div class=\"sim-app-topline\"><span>Partida: <b>{_html_escape(game_name)}</b></span><span>Ronda {round_n}</span><span>{round_status_label}</span></div>", unsafe_allow_html=True)
 
@@ -7623,13 +7662,15 @@ if st.session_state["role"] == "team" and st.session_state["team_name"]:
     current_team_budget = get_team_budget_for_round(state, team)
     st.markdown(f"<div class=\"sim-view-caption\">Vista del equipo: <b>{_html_escape(team)}</b></div>", unsafe_allow_html=True)
 
-    existing_entry = get_decision(game_id, team, round_n)
-    if existing_entry:
-        st.caption(f"Último envío: {existing_entry['submitted_at']}")
-        if existing_entry["reviewed"]:
-            st.success("El profesor ya ha revisado esta decisión.")
-        if existing_entry["review_notes"]:
-            st.info(f"Notas del profesor: {existing_entry['review_notes']}")
+    existing_entry = None
+    if team_section in ("Mi decisión", "Presupuesto"):
+        existing_entry = cached_get_decision(game_id, team, round_n)
+        if existing_entry:
+            st.caption(f"Último envío: {existing_entry['submitted_at']}")
+            if existing_entry["reviewed"]:
+                st.success("El profesor ya ha revisado esta decisión.")
+            if existing_entry["review_notes"]:
+                st.info(f"Notas del profesor: {existing_entry['review_notes']}")
 
     if team_section == "Resumen":
         render_team_summary(team, state, current_team_budget, round_n)
@@ -7653,6 +7694,7 @@ if st.session_state["role"] == "team" and st.session_state["team_name"]:
             
             if st.button("Guardar / enviar decisión", use_container_width=True):
                 upsert_decision(game_id, team, round_n, payload)
+                clear_runtime_cache()
                 st.success("Decisión guardada correctamente.")
                 st.rerun()
 
@@ -7729,6 +7771,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
                             event_this_round=False,
                             professor_password=new_prof_password or "admin123",
                         )
+                        clear_runtime_cache()
                         switch_game(new_game_id)
                         st.success("Partida creada correctamente.")
                         st.rerun()
@@ -7741,6 +7784,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
             if st.button("Renombrar partida actual"):
                 try:
                     rename_game(game_id, rename_value.strip())
+                    clear_runtime_cache()
                     st.success("Partida renombrada.")
                     st.rerun()
                 except Exception as e:
@@ -7755,6 +7799,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
                 try:
                     new_copy_id = duplicate_game(game_id, duplicate_name.strip())
                     if new_copy_id is not None:
+                        clear_runtime_cache()
                         switch_game(new_copy_id)
                         st.success("Partida duplicada.")
                         st.rerun()
@@ -7768,6 +7813,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
             if st.button("Borrar partida actual", disabled=not confirm_delete):
                 try:
                     delete_game(game_id)
+                    clear_runtime_cache()
                     remaining_id = get_latest_game_id()
                     if remaining_id is not None:
                         switch_game(remaining_id)
@@ -7822,6 +7868,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
                     current_prof_password = professor_new_password or "admin123"
 
                     delete_game(game_id)
+                    clear_runtime_cache()
                     recreated_game_id = create_game(
                         game_name=game_name,
                         teams=new_teams,
@@ -7838,6 +7885,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
                         event_this_round=False,
                         professor_password=current_prof_password,
                     )
+                    clear_runtime_cache()
                     switch_game(recreated_game_id)
                     st.success("Partida reiniciada.")
                     st.rerun()
@@ -7846,6 +7894,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
 
         if professor_new_password and st.button("Cambiar solo la clave del profesor"):
             set_professor_password(game_id, professor_new_password)
+            clear_runtime_cache()
             st.success("Clave del profesor actualizada")
 
     with st.expander("Claves de equipos", expanded=False):
@@ -7858,6 +7907,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
             if st.button(f"Guardar clave de {team}", key=f"save_pwd_{game_id}_{team}"):
                 if new_team_password:
                     update_team_password(game_id, team, new_team_password)
+                    clear_runtime_cache()
                     st.success(f"Clave actualizada para {team}")
                 else:
                     st.warning("Escribe una clave antes de guardar.")
@@ -7905,11 +7955,13 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
         with col_a:
             if st.button("Marcar como revisada"):
                 set_review_status(game_id, selected_team_review, round_n, True, note)
+                clear_runtime_cache()
                 st.success("Decisión revisada")
                 st.rerun()
         with col_b:
             if st.button("Dejar pendiente"):
                 set_review_status(game_id, selected_team_review, round_n, False, note)
+                clear_runtime_cache()
                 st.info("Decisión marcada como pendiente")
                 st.rerun()
     else:
@@ -7920,11 +7972,13 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
     with col1:
         if st.button("Habrá evento aleatorio"):
             update_game_state(game_id, event_this_round=True)
+            clear_runtime_cache()
             st.success("Esta ronda tendrá evento aleatorio")
             st.rerun()
     with col2:
         if st.button("No habrá evento"):
             update_game_state(game_id, event_this_round=False)
+            clear_runtime_cache()
             st.info("Esta ronda no tendrá evento")
             st.rerun()
 
@@ -7980,6 +8034,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
             round_status="closed",
             event_this_round=False,
         )
+        clear_runtime_cache()
         st.success("Ronda cerrada correctamente")
         st.rerun()
 
@@ -7992,6 +8047,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
             round_status="open",
             event_this_round=False,
         )
+        clear_runtime_cache()
         st.success("Siguiente ronda abierta")
         st.rerun()
 

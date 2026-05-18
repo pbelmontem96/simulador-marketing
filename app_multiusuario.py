@@ -207,7 +207,9 @@ def compute_next_budget_details(previous_budget, budget_remaining_actual, profit
     """Calcula el presupuesto de la siguiente ronda de forma controlada.
 
     Regla docente:
-    - El presupuesto siguiente parte del saldo real no gastado + beneficio de la ronda.
+    - El presupuesto siguiente parte del presupuesto disponible de la ronda anterior + beneficio neto de la ronda.
+    - El beneficio ya descuenta la inversión de marketing, producto, promoción, distribución e informes, por lo que no debe restarse dos veces el gasto realizado.
+    - Si el beneficio es positivo, el presupuesto operativo sube; si es negativo, baja.
     - El crecimiento máximo queda limitado al 40% respecto al presupuesto disponible de la ronda anterior.
     - El exceso se interpreta como impuestos, reservas legales y estructura financiera.
     - Se mantiene un suelo mínimo para que un equipo no quede expulsado del juego por una mala ronda.
@@ -216,7 +218,12 @@ def compute_next_budget_details(previous_budget, budget_remaining_actual, profit
     budget_remaining_actual = float(budget_remaining_actual or 0.0)
     profit = float(profit or 0.0)
 
-    raw_next_budget = budget_remaining_actual + profit
+    # IMPORTANTE:
+    # El beneficio del motor ya resta todos los gastos de marketing de la ronda
+    # (comunicación, promoción, distribución, producto e informes).
+    # Por eso el presupuesto siguiente no debe ser saldo restante + beneficio,
+    # ya que eso restaría dos veces la inversión realizada.
+    raw_next_budget = previous_budget + profit
     growth_cap = previous_budget * (1.0 + float(growth_cap_rate))
     budget_after_cap = min(raw_next_budget, growth_cap)
     taxes_and_reserves = max(0.0, raw_next_budget - growth_cap)
@@ -3276,7 +3283,7 @@ def _render_budget_phase1_status(current_team_budget, budget_used, budget_remain
         f"""
         <div class="budget-section">
             <div class="budget-section-title">1. Estado del presupuesto</div>
-            <div class="budget-note">ⓘ El presupuesto de la siguiente ronda se calcula con saldo restante + beneficio, pero su crecimiento máximo está limitado al 40%. Si se supera, el exceso se explica como impuestos, reservas legales y estructura financiera.</div>
+            <div class="budget-note">ⓘ El presupuesto de la siguiente ronda se calcula con presupuesto anterior + beneficio neto. El beneficio ya descuenta la inversión realizada, por lo que no se resta dos veces el gasto. El crecimiento máximo está limitado al 40%; si se supera, el exceso se explica como impuestos, reservas legales y estructura financiera.</div>
             <div class="budget-kpi-grid">{''.join(cards)}</div>
             <div class="budget-status-bar-wrap">
                 <div class="budget-status-top">

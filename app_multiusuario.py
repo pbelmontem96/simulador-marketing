@@ -200,9 +200,52 @@ def get_team_budget_for_round(state, team_name):
     return float(state.get("budget_per_team", 0.0))
 
 
-def compute_next_team_budget(base_budget, budget_remaining_actual, profit, reinvestment_rate=0.50):
-    next_budget = float(base_budget) + float(budget_remaining_actual) + reinvestment_rate * float(profit)
-    return max(get_budget_floor(base_budget), next_budget)
+BUDGET_GROWTH_CAP_RATE = 0.40
+
+
+def compute_next_budget_details(previous_budget, budget_remaining_actual, profit, growth_cap_rate=BUDGET_GROWTH_CAP_RATE):
+    """Calcula el presupuesto de la siguiente ronda de forma controlada.
+
+    Regla docente:
+    - El presupuesto siguiente parte del saldo real no gastado + beneficio de la ronda.
+    - El crecimiento máximo queda limitado al 40% respecto al presupuesto disponible de la ronda anterior.
+    - El exceso se interpreta como impuestos, reservas legales y estructura financiera.
+    - Se mantiene un suelo mínimo para que un equipo no quede expulsado del juego por una mala ronda.
+    """
+    previous_budget = float(previous_budget or 0.0)
+    budget_remaining_actual = float(budget_remaining_actual or 0.0)
+    profit = float(profit or 0.0)
+
+    raw_next_budget = budget_remaining_actual + profit
+    growth_cap = previous_budget * (1.0 + float(growth_cap_rate))
+    budget_after_cap = min(raw_next_budget, growth_cap)
+    taxes_and_reserves = max(0.0, raw_next_budget - growth_cap)
+    budget_floor = get_budget_floor(previous_budget)
+    next_budget = max(budget_floor, budget_after_cap)
+    floor_support = max(0.0, budget_floor - budget_after_cap)
+
+    return {
+        "previous_budget": previous_budget,
+        "budget_remaining_actual": budget_remaining_actual,
+        "profit": profit,
+        "raw_next_budget": raw_next_budget,
+        "growth_cap": growth_cap,
+        "growth_cap_rate": float(growth_cap_rate),
+        "taxes_and_reserves": taxes_and_reserves,
+        "budget_floor": budget_floor,
+        "floor_support": floor_support,
+        "next_budget": next_budget,
+        "cap_applied": taxes_and_reserves > 0.01,
+        "floor_applied": floor_support > 0.01,
+    }
+
+
+def compute_next_team_budget(previous_budget, budget_remaining_actual, profit):
+    return compute_next_budget_details(
+        previous_budget=previous_budget,
+        budget_remaining_actual=budget_remaining_actual,
+        profit=profit,
+    )["next_budget"]
 
 
 def ensure_first_game_exists():
@@ -276,8 +319,9 @@ def backfill_team_budgets_from_history(state):
 
     rebuilt = {}
     for row in last_round:
+        previous_budget = row.get("budget_available", base_budget)
         rebuilt[row["team"]] = compute_next_team_budget(
-            base_budget=base_budget,
+            previous_budget=previous_budget,
             budget_remaining_actual=row.get("budget_remaining_actual", 0.0),
             profit=row.get("profit", 0.0),
         )
@@ -3142,7 +3186,7 @@ def inject_budget_phase1_styles():
     .budget-section {background:#fff;border:1px solid #DDE7F3;border-radius:18px;padding:18px 18px 20px 18px;margin:16px 0;box-shadow:0 12px 32px rgba(9,30,66,.06);}
     .budget-section-title {color:#0B4B93;font-size:1.12rem;font-weight:950;text-transform:uppercase;margin:0 0 14px 0;letter-spacing:-.02em;}
     .budget-note {background:#EAF4FF;border-radius:13px;padding:12px 16px;color:#0A3472;font-size:.88rem;font-weight:850;margin-bottom:16px;}
-    .budget-kpi-grid {display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:16px;}
+    .budget-kpi-grid {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:16px;}
     .budget-kpi-card {background:#fff;border:1px solid #DCE6F2;border-radius:15px;min-height:154px;padding:18px 14px;box-shadow:0 7px 22px rgba(9,30,66,.055);display:flex;gap:13px;align-items:center;overflow:hidden;position:relative;}
     .budget-kpi-card:after {content:"";position:absolute;right:-34px;top:-44px;width:105px;height:105px;border-radius:999px;opacity:.55;background:var(--soft-bg);}
     .budget-kpi-icon {width:62px;height:62px;border-radius:50%;flex:0 0 62px;display:flex;align-items:center;justify-content:center;font-size:1.55rem;color:var(--main-color);background:var(--soft-bg);z-index:1;}
@@ -3202,7 +3246,7 @@ def _render_budget_phase1_header(team, round_display, status, current_team_budge
     )
 
 
-def _render_budget_phase1_status(current_team_budget, budget_used, budget_remaining, last_profit, accumulated_profit, accumulated_marketing_investment=0.0):
+def _render_budget_phase1_status(current_team_budget, budget_used, budget_remaining, last_profit, accumulated_profit, accumulated_marketing_investment=0.0, last_taxes_and_reserves=0.0, last_budget_cap_applied=False):
     budget_pct_raw = (float(budget_used) / max(float(current_team_budget), 1.0)) * 100
     budget_pct = max(0.0, min(100.0, budget_pct_raw))
     remaining_pct = max(0.0, 100.0 - budget_pct_raw)
@@ -3218,13 +3262,21 @@ def _render_budget_phase1_status(current_team_budget, budget_used, budget_remain
         _budget_phase1_kpi_card("Presupuesto utilizado", fmt_eur(budget_used), f"{pct_text}% del total", "◔", "blue"),
         _budget_phase1_kpi_card("Presupuesto restante", fmt_eur(budget_remaining), f"{rem_pct_text}% disponible", "🎯", "orange", remaining_note_tone),
         _budget_phase1_kpi_card("Beneficio última ronda", fmt_eur(last_profit), "Última ronda cerrada", "📈", "purple"),
+        _budget_phase1_kpi_card(
+            "Impuestos y reservas",
+            fmt_eur(last_taxes_and_reserves),
+            "Límite de crecimiento aplicado" if last_budget_cap_applied else "Sin ajuste fiscal en la última ronda",
+            "🏛️",
+            "red" if last_budget_cap_applied else "teal",
+            "warning" if last_budget_cap_applied else "positive",
+        ),
         _budget_phase1_kpi_card("ROI de marketing", fmt_roi(accumulated_roi), "Beneficio / inversión acumulada", "📊", "teal", accumulated_roi_tone),
     ]
     st.markdown(
         f"""
         <div class="budget-section">
             <div class="budget-section-title">1. Estado del presupuesto</div>
-            <div class="budget-note">ⓘ Estas métricas muestran el presupuesto disponible, la inversión actual y la eficiencia acumulada del marketing.</div>
+            <div class="budget-note">ⓘ El presupuesto de la siguiente ronda se calcula con saldo restante + beneficio, pero su crecimiento máximo está limitado al 40%. Si se supera, el exceso se explica como impuestos, reservas legales y estructura financiera.</div>
             <div class="budget-kpi-grid">{''.join(cards)}</div>
             <div class="budget-status-bar-wrap">
                 <div class="budget-status-top">
@@ -3836,11 +3888,25 @@ def render_team_budget(team, teams, engine, state, current_team_budget, round_n,
     accumulated_roi = compute_marketing_roi(accumulated_profit, accumulated_marketing_investment)
     accumulated_roi_note, accumulated_roi_tone = marketing_roi_message(accumulated_roi)
 
+    last_truth = state.get("last_truth") or []
+    last_team_truth = next((row for row in last_truth if row.get("team") == team), {})
+    last_taxes_and_reserves = float(last_team_truth.get("taxes_and_reserves", 0.0) or 0.0)
+    last_budget_cap_applied = bool(last_team_truth.get("budget_cap_applied", False))
+
     round_display = state.get("round_n", round_n)
     status_display = "abierta" if state.get("round_status") == "open" else state.get("round_status", "-")
 
     _render_budget_phase1_header(team, round_display, status_display, current_team_budget)
-    _render_budget_phase1_status(current_team_budget, budget_used, budget_remaining, last_profit, accumulated_profit, accumulated_marketing_investment)
+    _render_budget_phase1_status(
+        current_team_budget,
+        budget_used,
+        budget_remaining,
+        last_profit,
+        accumulated_profit,
+        accumulated_marketing_investment,
+        last_taxes_and_reserves,
+        last_budget_cap_applied,
+    )
 
     render_budget_phase2_forecast(expected_revenue, production_cost, marketing_investment, expected_profit)
 
@@ -8017,11 +8083,24 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
 
         next_team_budgets = {}
         for row in truth:
-            next_team_budgets[row["team"]] = compute_next_team_budget(
-                base_budget=state["budget_per_team"],
+            budget_details = compute_next_budget_details(
+                previous_budget=row.get("budget_available", get_team_budget_for_round(state, row["team"])),
                 budget_remaining_actual=row.get("budget_remaining_actual", 0.0),
                 profit=row.get("profit", 0.0),
             )
+            row["next_budget_raw"] = float(budget_details["raw_next_budget"])
+            row["budget_growth_cap"] = float(budget_details["growth_cap"])
+            row["budget_growth_cap_rate"] = float(budget_details["growth_cap_rate"])
+            row["taxes_and_reserves"] = float(budget_details["taxes_and_reserves"])
+            row["budget_floor"] = float(budget_details["budget_floor"])
+            row["budget_floor_support"] = float(budget_details["floor_support"])
+            row["next_budget"] = float(budget_details["next_budget"])
+            row["budget_cap_applied"] = bool(budget_details["cap_applied"])
+            row["budget_floor_applied"] = bool(budget_details["floor_applied"])
+            next_team_budgets[row["team"]] = float(budget_details["next_budget"])
+
+        # Actualizamos el histórico con los datos presupuestarios ya enriquecidos.
+        history[-1]["truth"] = truth
 
         update_game_state(
             game_id,

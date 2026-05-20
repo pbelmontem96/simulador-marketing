@@ -130,6 +130,19 @@ class MarketEngine:
             "customer_base": self.customer_base.tolist(),
             "inventory": self.inventory.tolist(),
             "rng_state": self.rng.bit_generator.state,
+            # Modificadores temporales de evento.
+            # Se guardan para permitir que el profesor genere un evento al abrir la ronda
+            # y que ese mismo evento se aplique exactamente al cerrar la ronda.
+            "round_modifiers": {
+                "market_mult": float(getattr(self, "market_mult", 1.0)),
+                "ad_effect_mult": float(getattr(self, "ad_effect_mult", 1.0)),
+                "price_sens_mult": float(getattr(self, "price_sens_mult", 1.0)),
+                "promo_effect_mult": float(getattr(self, "promo_effect_mult", 1.0)),
+                "team_awareness_boost": getattr(self, "team_awareness_boost", np.zeros(self.B)).tolist(),
+                "team_dist_mult": getattr(self, "team_dist_mult", np.ones(self.B)).tolist(),
+                "team_unit_cost_mult": getattr(self, "team_unit_cost_mult", np.ones(self.B)).tolist(),
+                "team_capacity_mult": getattr(self, "team_capacity_mult", np.ones(self.B)).tolist(),
+            },
         }
 
     def set_state(self, state):
@@ -150,7 +163,30 @@ class MarketEngine:
 
         self.rng = np.random.default_rng()
         self.rng.bit_generator.state = state["rng_state"]
+
         self._reset_round_modifiers()
+        modifiers = state.get("round_modifiers") or {}
+        if modifiers:
+            self.market_mult = float(modifiers.get("market_mult", self.market_mult))
+            self.ad_effect_mult = float(modifiers.get("ad_effect_mult", self.ad_effect_mult))
+            self.price_sens_mult = float(modifiers.get("price_sens_mult", self.price_sens_mult))
+            self.promo_effect_mult = float(modifiers.get("promo_effect_mult", self.promo_effect_mult))
+            self.team_awareness_boost = np.array(
+                modifiers.get("team_awareness_boost", self.team_awareness_boost),
+                dtype=float
+            )
+            self.team_dist_mult = np.array(
+                modifiers.get("team_dist_mult", self.team_dist_mult),
+                dtype=float
+            )
+            self.team_unit_cost_mult = np.array(
+                modifiers.get("team_unit_cost_mult", self.team_unit_cost_mult),
+                dtype=float
+            )
+            self.team_capacity_mult = np.array(
+                modifiers.get("team_capacity_mult", self.team_capacity_mult),
+                dtype=float
+            )
 
     # -----------------------------
     # UTILIDADES

@@ -8018,19 +8018,55 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
         st.info("Ese equipo aún no ha enviado decisión.")
 
     st.markdown("### Evento aleatorio")
+    current_engine_state = state.get("engine_state", {}) or {}
+    pending_event = current_engine_state.get("_pending_event")
+
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Habrá evento aleatorio"):
-            update_game_state(game_id, event_this_round=True)
+        if st.button("Generar evento aleatorio"):
+            fresh_state = load_game_state(game_id)
+            engine_for_event = MarketEngine(fresh_state["teams"])
+            engine_for_event.set_state(fresh_state["engine_state"])
+            generated_event = engine_for_event.random_event()
+            generated_engine_state = engine_for_event.get_state()
+            generated_engine_state["_pending_event"] = generated_event
+
+            update_game_state(
+                game_id,
+                engine_state=generated_engine_state,
+                event_this_round=True,
+            )
             clear_runtime_cache()
-            st.success("Esta ronda tendrá evento aleatorio")
+            st.success(f"Evento generado: {generated_event.get('title', 'Suceso aleatorio')}")
             st.rerun()
     with col2:
         if st.button("No habrá evento"):
-            update_game_state(game_id, event_this_round=False)
+            fresh_state = load_game_state(game_id)
+            engine_without_event = MarketEngine(fresh_state["teams"])
+            engine_without_event.set_state(fresh_state["engine_state"])
+            engine_without_event._reset_round_modifiers()
+            clean_engine_state = engine_without_event.get_state()
+            clean_engine_state.pop("_pending_event", None)
+
+            update_game_state(
+                game_id,
+                engine_state=clean_engine_state,
+                event_this_round=False,
+            )
             clear_runtime_cache()
             st.info("Esta ronda no tendrá evento")
             st.rerun()
+
+    current_engine_state = load_current_state().get("engine_state", {}) if load_current_state() else current_engine_state
+    pending_event = current_engine_state.get("_pending_event")
+    if state.get("event_this_round") and pending_event:
+        st.success(f"**Evento preparado para esta ronda:** {pending_event.get('title', 'Suceso aleatorio')}")
+        st.caption(pending_event.get("desc", ""))
+        st.info(f"Impacto previsto: {pending_event.get('extra', 'Se aplicará al cerrar la ronda.')}")
+    elif state.get("event_this_round"):
+        st.warning("Hay evento marcado para esta ronda, pero aún no hay evento concreto generado. Al cerrar la ronda se generará automáticamente.")
+    else:
+        st.caption("No hay evento preparado para esta ronda.")
 
     pending = [t for t in teams if t not in all_decisions]
     not_reviewed = [t for t in teams if t in all_decisions and not all_decisions[t]["reviewed"]]
@@ -8051,13 +8087,26 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
         engine.set_state(state["engine_state"])
         decisions_payload: Dict[str, dict] = {team: all_decisions[team]["decision"] for team in state["teams"]}
 
+        pending_event = (state.get("engine_state", {}) or {}).get("_pending_event")
         if state["event_this_round"]:
-            event = engine.random_event()
+            if pending_event:
+                # El evento ya fue generado por el profesor y sus modificadores
+                # están restaurados desde engine_state. Se aplica exactamente ese.
+                event = pending_event
+            else:
+                # Compatibilidad con partidas antiguas: si solo estaba marcado
+                # event_this_round=True, se genera en el cierre como antes.
+                event = engine.random_event()
         else:
             engine._reset_round_modifiers()
             event = None
 
         truth, research, _ = engine.step(decisions_payload)
+        # Los modificadores del evento son de una sola ronda. Se limpian tras
+        # calcular resultados para que no contaminen la siguiente ronda.
+        engine._reset_round_modifiers()
+        updated_engine_state = engine.get_state()
+        updated_engine_state.pop("_pending_event", None)
         history = state["history"] + [{
             "round": state["round_n"],
             "truth": truth,
@@ -8075,7 +8124,7 @@ elif st.session_state["role"] == "professor" and st.session_state["professor_ok"
 
         update_game_state(
             game_id,
-            engine_state=engine.get_state(),
+            engine_state=updated_engine_state,
             history=history,
             last_truth=truth,
             last_research=research,
